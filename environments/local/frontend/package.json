@@ -1,0 +1,17 @@
+{
+  "name": "tasks-frontend-local",
+  "version": "1.0.0",
+  "description": "Tasks Frontend - Local Development",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "dependencies": {
+    "express": "^4.17.1",
+    "cors": "^2.8.5"
+  },
+  "devDependencies": {
+    "nodemon": "^2.0.15"
+  }
+}

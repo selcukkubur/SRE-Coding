@@ -1,0 +1,69 @@
+name: Deploy Tasks API
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v2
+    
+    - name: Set up Node.js
+      uses: actions/setup-node@v2
+      with:
+        node-version: '18'
+        
+    - name: Install Dependencies
+      run: |
+        cd backend
+        npm install
+        
+    - name: Run Tests
+      run: |
+        cd backend
+        npm test
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - uses: actions/checkout@v2
+    
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-1
+        
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v1
+      
+    - name: Terraform Init
+      run: |
+        cd infrastructure/terraform
+        terraform init
+        
+    - name: Terraform Plan
+      run: |
+        cd infrastructure/terraform
+        terraform plan
+        
+    - name: Terraform Apply
+      if: github.ref == 'refs/heads/main'
+      run: |
+        cd infrastructure/terraform
+        terraform apply -auto-approve
+        
+    - name: Build and Deploy Frontend
+      run: |
+        cd frontend
+        npm install
+        npm run build
+        aws s3 sync dist/ s3://${{ secrets.FRONTEND_BUCKET_NAME }} --delete

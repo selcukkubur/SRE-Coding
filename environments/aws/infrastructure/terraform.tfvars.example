@@ -1,0 +1,33 @@
+# General Configuration
+aws_region = "us-east-1"
+project_name = "tasks-api"
+environment = "prod"
+
+# Frontend Configuration
+frontend_bucket_name = "sre-exercise-bondex-2025"
+
+# Database Configuration
+database_name = "tasks_db"
+database_username = "taskmaster"
+database_instance_class = "db.t3.micro"
+
+# Monitoring Configuration (Placeholder values for exercise)
+sentry_dsn = "https://placeholder@placeholder.ingest.sentry.io/0000000"
+splunk_hec_url = "http://placeholder-splunk:8088"
+splunk_hec_token = "placeholder-token"
+alert_email = "selcukkubur@hotmail.com"
+
+# Lambda Configuration
+lambda_memory = 256
+lambda_timeout = 30
+
+# Security Configuration
+enable_vpc_endpoints = true
+
+# Tags
+tags = {
+  Project     = "SRE-Coding-Exercise"
+  Environment = "Production"
+  ManagedBy   = "Terraform"
+  Owner       = "YourName"
+}

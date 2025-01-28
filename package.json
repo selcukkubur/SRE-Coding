@@ -1,0 +1,20 @@
+{
+  "name": "sre-coding-exercise",
+  "version": "1.0.0",
+  "description": "SRE Coding Exercise - Serverless Task Management Application",
+  "scripts": {
+    "install:local": "cd environments/local/backend && npm install && cd ../frontend && npm install",
+    "install:aws": "cd environments/aws/backend && npm install && cd ../frontend && npm install",
+    "start:local": "cd environments/local && docker-compose up",
+    "start:local:frontend": "cd environments/local/frontend && npm run dev",
+    "deploy:aws": "cd environments/aws/infrastructure && terraform apply",
+    "test:local": "cd environments/local/backend && npm test",
+    "test:aws": "cd environments/aws/backend && npm test"
+  },
+  "author": "",
+  "license": "ISC",
+  "workspaces": [
+    "environments/local/*",
+    "environments/aws/*"
+  ]
+}
