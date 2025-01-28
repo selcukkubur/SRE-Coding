@@ -61,6 +61,19 @@ jobs:
         cd infrastructure/terraform
         terraform apply -auto-approve
         
+    - name: Build and Package Lambda
+      run: |
+        cd environments/aws/backend
+        npm install
+        npm run deploy
+        
+    - name: Deploy to Lambda
+      run: |
+        cd environments/aws/backend/dist
+        aws lambda update-function-code \
+          --function-name ${{ secrets.AWS_LAMBDA_FUNCTION_NAME }} \
+          --zip-file fileb://lambda.zip
+
     - name: Build and Deploy Frontend
       run: |
         cd frontend
