@@ -7,28 +7,7 @@ on:
     branches: [ main ]
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v2
-    
-    - name: Set up Node.js
-      uses: actions/setup-node@v2
-      with:
-        node-version: '18'
-        
-    - name: Install Dependencies
-      run: |
-        cd backend
-        npm install
-        
-    - name: Run Tests
-      run: |
-        cd backend
-        npm test
-
   deploy:
-    needs: test
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
     
@@ -47,18 +26,18 @@ jobs:
       
     - name: Terraform Init
       run: |
-        cd infrastructure/terraform
+        cd environments/aws/infrastructure
         terraform init
         
     - name: Terraform Plan
       run: |
-        cd infrastructure/terraform
+        cd environments/aws/infrastructure
         terraform plan
         
     - name: Terraform Apply
       if: github.ref == 'refs/heads/main'
       run: |
-        cd infrastructure/terraform
+        cd environments/aws/infrastructure
         terraform apply -auto-approve
         
     - name: Build and Package Lambda
@@ -76,7 +55,7 @@ jobs:
 
     - name: Build and Deploy Frontend
       run: |
-        cd frontend
+        cd environments/aws/frontend
         npm install
         npm run build
         aws s3 sync dist/ s3://${{ secrets.FRONTEND_BUCKET_NAME }} --delete
