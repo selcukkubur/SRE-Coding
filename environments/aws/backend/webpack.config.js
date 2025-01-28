@@ -3,10 +3,12 @@ const path = require('path');
 module.exports = {
   entry: './src/index.js',
   target: 'node',
+  mode: 'production',
   output: {
     filename: 'index.js',
     path: path.resolve(__dirname, 'dist'),
-    libraryTarget: 'commonjs2'
+    libraryTarget: 'commonjs2',
+    clean: true
   },
   module: {
     rules: [
@@ -25,5 +27,13 @@ module.exports = {
   externals: {
     'aws-sdk': 'aws-sdk',
     'pg-native': 'pg-native'
+  },
+  optimization: {
+    minimize: false
+  },
+  resolve: {
+    fallback: {
+      'pg-native': false
+    }
   }
 };

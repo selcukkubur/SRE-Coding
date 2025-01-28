@@ -1,138 +1,415 @@
-const { Pool } = require('pg');
-const Sentry = require('@sentry/node');
-
-// Initialize Sentry
-Sentry.init({
-    dsn: process.env.SENTRY_DSN,
-    environment: process.env.AWS_LAMBDA_FUNCTION_NAME,
-    tracesSampleRate: 1.0,
-    integrations: [
-        new Sentry.Integrations.Postgres()
-    ]
-});
+const pg = require('pg');
+pg.defaults.native = false; // Disable native bindings
+const { Pool } = pg;
 
 // Database configuration
-const pool = new Pool({
+const dbConfig = {
     host: process.env.DB_HOST,
+    port: parseInt(process.env.DB_PORT || '5432', 10),
     database: process.env.DB_NAME,
     user: process.env.DB_USER,
     password: process.env.DB_PASSWORD,
-    port: 5432,
     ssl: {
         rejectUnauthorized: false
-    }
+    },
+    connectionTimeoutMillis: 5000
+};
+
+console.log('Starting Lambda with config:', { 
+    host: dbConfig.host,
+    database: dbConfig.database,
+    user: dbConfig.user,
+    port: dbConfig.port,
+    ssl: dbConfig.ssl ? 'enabled' : 'disabled'
 });
 
-// Helper function to handle database errors
-const handleDatabaseError = (error, context) => {
-    console.error('Database error:', error);
-    Sentry.withScope(scope => {
-        scope.setExtra('context', context);
-        Sentry.captureException(error);
+const pool = new Pool(dbConfig);
+
+// Add connection event handlers
+pool.on('connect', () => {
+    console.log('New client connected to the pool');
+});
+
+pool.on('acquire', () => {
+    console.log('Client acquired from the pool');
+});
+
+pool.on('remove', () => {
+    console.log('Client removed from the pool');
+});
+
+// Test database connection
+pool.on('error', (err) => {
+    console.error('Unexpected error on idle client', err);
+    console.error('Error details:', {
+        code: err.code,
+        message: err.message,
+        stack: err.stack
     });
+});
+
+// Check if table exists
+const checkTableExists = async (client) => {
+    const result = await client.query(`
+        SELECT EXISTS (
+            SELECT FROM information_schema.tables 
+            WHERE table_schema = 'public'
+            AND table_name = 'tasks'
+        );
+    `);
+    return result.rows[0].exists;
+};
+
+const getCorsHeaders = () => ({
+    'Access-Control-Allow-Origin': process.env.ALLOWED_ORIGIN || 'https://d3k2p6z3f2d2f6.cloudfront.net',
+    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Amz-Date, X-Api-Key, X-Amz-Security-Token, X-Requested-With',
+    'Access-Control-Allow-Credentials': 'true',
+    'Access-Control-Expose-Headers': '*',
+    'Content-Type': 'application/json'
+});
+
+// Helper function for responses
+const createResponse = (statusCode, body, additionalHeaders = {}) => ({
+    statusCode,
+    headers: {
+        ...getCorsHeaders(),
+        ...additionalHeaders
+    },
+    body: typeof body === 'string' ? body : JSON.stringify(body)
+});
+
+// Test database connectivity with retries
+const testConnection = async (retries = 3, delay = 1000) => {
+    let lastError;
+    for (let i = 0; i < retries; i++) {
+        let testClient;
+        try {
+            console.log(`Testing database connection (attempt ${i + 1}/${retries})...`);
+            testClient = await pool.connect();
+            await testClient.query('SELECT NOW()');
+            console.log('Database connection test successful');
+            return true;
+        } catch (error) {
+            lastError = error;
+            console.error(`Database connection test failed (attempt ${i + 1}/${retries}):`, error);
+            console.error('Connection error details:', {
+                code: error.code,
+                message: error.message,
+                stack: error.stack,
+                host: dbConfig.host,
+                port: dbConfig.port,
+                database: dbConfig.database,
+                user: dbConfig.user,
+                ssl: dbConfig.ssl ? 'enabled' : 'disabled'
+            });
+            
+            if (i < retries - 1) {
+                console.log(`Waiting ${delay}ms before next attempt...`);
+                await new Promise(resolve => setTimeout(resolve, delay));
+            }
+        } finally {
+            if (testClient) {
+                testClient.release();
+            }
+        }
+    }
+
+    console.error('All database connection attempts failed');
+    throw lastError;
+};
+
+// Validate API Gateway event
+const validateEvent = (event) => {
+    if (!event.requestContext) {
+        throw new Error('Missing requestContext in event');
+    }
+    if (!event.requestContext.http) {
+        throw new Error('Missing http context in event.requestContext');
+    }
+    if (!event.requestContext.http.method) {
+        throw new Error('Missing http method in event.requestContext.http');
+    }
+    if (!event.rawPath) {
+        throw new Error('Missing rawPath in event');
+    }
     return {
-        statusCode: 500,
-        headers: {
-            'Content-Type': 'application/json',
-            'Access-Control-Allow-Origin': '*'
-        },
-        body: JSON.stringify({
-            error: 'Internal server error',
-            requestId: context.awsRequestId
-        })
+        method: event.requestContext.http.method,
+        path: event.rawPath,
+        body: event.body
     };
 };
 
-// Helper function for successful responses
-const createResponse = (statusCode, body) => ({
-    statusCode,
-    headers: {
-        'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*'
-    },
-    body: JSON.stringify(body)
-});
-
 // Main Lambda handler
 exports.handler = async (event, context) => {
-    // Enable Sentry request handling
-    const transaction = Sentry.startTransaction({
-        op: 'lambda',
-        name: event.requestContext?.routeKey || 'unknown'
-    });
+    console.log('Lambda invoked with event:', JSON.stringify(event, null, 2));
+    console.log('Context:', JSON.stringify(context, null, 2));
 
+    let client;
     try {
-        console.log('Event:', JSON.stringify(event));
+        // Validate event structure
+        const { method, path, body } = validateEvent(event);
+        console.log('Validated request:', { method, path });
 
-        // Handle OPTIONS requests for CORS
-        if (event.requestContext?.http?.method === 'OPTIONS') {
-            return {
-                statusCode: 200,
-                headers: {
-                    'Access-Control-Allow-Origin': '*',
-                    'Access-Control-Allow-Headers': 'Content-Type',
-                    'Access-Control-Allow-Methods': 'OPTIONS,POST,GET'
-                }
-            };
+        // Handle OPTIONS requests for CORS first
+        if (method === 'OPTIONS') {
+            return createResponse(200, '');
         }
 
-        // Route handling
-        const route = event.requestContext?.http?.method + ' ' + event.requestContext?.http?.path;
+        // Test database connection
+        try {
+            await testConnection();
+        } catch (connectionError) {
+            console.error('Database connection test failed:', connectionError);
+            return createResponse(500, {
+                error: 'Database connection failed',
+                message: connectionError.message,
+                code: connectionError.code || 'DB_CONNECTION_ERROR',
+                requestId: context.awsRequestId,
+                timestamp: new Date().toISOString(),
+                details: {
+                    host: dbConfig.host,
+                    port: dbConfig.port,
+                    database: dbConfig.database,
+                    user: dbConfig.user
+                }
+            });
+        }
 
-        switch (route) {
-            case 'POST /tasks': {
-                const { description } = JSON.parse(event.body);
-                
-                if (!description) {
-                    return createResponse(400, { error: 'Description is required' });
+        // Handle /tasks endpoint
+        if (path === '/tasks') {
+            // Acquire database client for all database operations
+            console.log('Acquiring database client...');
+            try {
+                client = await pool.connect();
+                console.log('Database client acquired');
+
+                // Initialize database first
+                console.log('Initializing database...');
+                const tableExists = await checkTableExists(client);
+                if (!tableExists) {
+                    console.log('Tasks table does not exist, creating...');
+                    await client.query(`
+                        CREATE TABLE tasks (
+                            id SERIAL PRIMARY KEY,
+                            title VARCHAR(255) NOT NULL,
+                            description TEXT NOT NULL,
+                            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                            updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                        )
+                    `);
+                    console.log('Tasks table created successfully');
+                } else {
+                    console.log('Tasks table already exists');
+                }
+                console.log('Database initialization complete');
+
+            } catch (connectionError) {
+                console.error('Database connection/initialization failed:', connectionError);
+                return createResponse(500, {
+                    error: 'Database initialization failed',
+                    message: connectionError.message,
+                    code: connectionError.code || 'DB_INIT_ERROR',
+                    requestId: context.awsRequestId,
+                    timestamp: new Date().toISOString(),
+                    details: {
+                        host: dbConfig.host,
+                        port: dbConfig.port,
+                        database: dbConfig.database,
+                        user: dbConfig.user,
+                        error: connectionError.message
+                    }
+                });
+            }
+
+            switch (method) {
+                case 'GET': {
+                    console.log('Executing GET /tasks query');
+                    try {
+                        const result = await client.query('SELECT * FROM tasks ORDER BY created_at DESC');
+                        console.log('GET /tasks result:', { count: result.rows.length });
+                        return createResponse(200, result.rows);
+                    } catch (dbError) {
+                        console.error('Database error during GET /tasks:', dbError);
+                        // Log detailed database error
+                        const dbErrorDetails = {
+                            message: dbError.message,
+                            code: dbError.code,
+                            stack: dbError.stack,
+                            requestId: context.awsRequestId,
+                            query: 'SELECT * FROM tasks',
+                            dbConfig: {
+                                host: dbConfig.host,
+                                database: dbConfig.database,
+                                user: dbConfig.user,
+                                ssl: dbConfig.ssl ? 'enabled' : 'disabled'
+                            }
+                        };
+                        console.error('Detailed database error:', JSON.stringify(dbErrorDetails, null, 2));
+
+                        return createResponse(500, {
+                            error: 'Database error',
+                            message: dbError.message,
+                            code: dbError.code || 'DB_ERROR',
+                            requestId: context.awsRequestId,
+                            timestamp: new Date().toISOString()
+                        });
+                    }
                 }
 
-                const result = await pool.query(
-                    'INSERT INTO tasks (description) VALUES ($1) RETURNING *',
-                    [description]
-                );
+                case 'POST': {
+                    console.log('Processing POST /tasks request');
+                    let parsedBody;
+                    try {
+                        parsedBody = body ? JSON.parse(body) : {};
+                    } catch (parseError) {
+                        console.error('Error parsing request body:', parseError);
+                        return createResponse(400, {
+                            error: 'Invalid JSON in request body',
+                            message: parseError.message,
+                            code: 'INVALID_JSON',
+                            requestId: context.awsRequestId,
+                            timestamp: new Date().toISOString(),
+                            details: {
+                                receivedBody: body,
+                                error: 'Failed to parse request body as JSON'
+                            }
+                        });
+                    }
 
-                return createResponse(201, result.rows[0]);
+                    console.log('Parsed request body:', parsedBody);
+                    const { title, description } = parsedBody;
+                    
+                    if (!title || !description) {
+                        console.log('Invalid request - missing title or description:', body);
+                        return createResponse(400, {
+                            error: 'Missing required fields',
+                            message: 'Title and description are required',
+                            code: 'MISSING_FIELDS',
+                            requestId: context.awsRequestId,
+                            timestamp: new Date().toISOString(),
+                            details: {
+                                received: { title, description },
+                                required: ['title', 'description']
+                            }
+                        });
+                    }
+
+                    try {
+                        console.log('Executing POST /tasks query with:', { title, description });
+                        const result = await client.query(
+                            'INSERT INTO tasks (title, description) VALUES ($1, $2) RETURNING *',
+                            [title, description]
+                        );
+                        console.log('POST /tasks result:', result.rows[0]);
+                        return createResponse(201, result.rows[0]);
+                    } catch (dbError) {
+                        console.error('Database error during POST /tasks:', dbError);
+                        console.error('Error details:', {
+                            code: dbError.code,
+                            message: dbError.message,
+                            stack: dbError.stack
+                        });
+                        // Log detailed database error
+                        const dbErrorDetails = {
+                            message: dbError.message,
+                            code: dbError.code,
+                            stack: dbError.stack,
+                            requestId: context.awsRequestId,
+                            query: 'INSERT INTO tasks',
+                            params: { title, description },
+                            dbConfig: {
+                                host: dbConfig.host,
+                                database: dbConfig.database,
+                                user: dbConfig.user,
+                                ssl: dbConfig.ssl ? 'enabled' : 'disabled'
+                            }
+                        };
+                        console.error('Detailed database error:', JSON.stringify(dbErrorDetails, null, 2));
+
+                        return createResponse(500, {
+                            error: 'Database error',
+                            message: dbError.message,
+                            code: dbError.code || 'DB_ERROR',
+                            requestId: context.awsRequestId,
+                            timestamp: new Date().toISOString()
+                        });
+                    }
+                }
+
+                default:
+                    console.log('Method not allowed:', method);
+                    return createResponse(405, {
+                        error: 'Method not allowed',
+                        message: `Method ${method} is not allowed for this endpoint`,
+                        code: 'METHOD_NOT_ALLOWED',
+                        requestId: context.awsRequestId,
+                        timestamp: new Date().toISOString(),
+                        details: {
+                            method: method,
+                            path: path,
+                            allowedMethods: ['GET', 'POST', 'OPTIONS']
+                        }
+                    });
             }
-
-            case 'GET /tasks': {
-                const result = await pool.query('SELECT * FROM tasks ORDER BY created_at DESC');
-                return createResponse(200, result.rows);
-            }
-
-            default:
-                return createResponse(404, { error: 'Not Found' });
         }
+
+        console.log('Route not found:', path);
+        return createResponse(404, {
+            error: 'Route not found',
+            message: `Path ${path} does not exist`,
+            code: 'ROUTE_NOT_FOUND',
+            requestId: context.awsRequestId,
+            timestamp: new Date().toISOString(),
+            details: {
+                path: path,
+                availableRoutes: ['/tasks']
+            }
+        });
+
     } catch (error) {
-        console.error('Error:', error);
-        Sentry.captureException(error);
+        console.error('Error processing request:', error);
+        console.error('Error details:', {
+            code: error.code,
+            message: error.message,
+            stack: error.stack
+        });
+        // Log the full error details
+        const errorDetails = {
+            message: error.message,
+            code: error.code,
+            stack: error.stack,
+            requestId: context.awsRequestId,
+            path: event.rawPath,
+            method: event.requestContext?.http?.method,
+            timestamp: new Date().toISOString(),
+            dbConfig: {
+                host: dbConfig.host,
+                database: dbConfig.database,
+                user: dbConfig.user,
+                ssl: dbConfig.ssl ? 'enabled' : 'disabled'
+            }
+        };
         
-        if (error instanceof SyntaxError) {
-            return createResponse(400, { error: 'Invalid request body' });
-        }
+        console.error('Full error details:', JSON.stringify(errorDetails, null, 2));
 
-        return handleDatabaseError(error, context);
+        // Return a sanitized error response
+        return createResponse(500, {
+            error: 'Internal server error',
+            message: error.message,
+            code: error.code || 'INTERNAL_ERROR',
+            requestId: context.awsRequestId,
+            timestamp: new Date().toISOString()
+        });
     } finally {
-        transaction.finish();
-        await Sentry.flush(2000);
-    }
-};
-
-// Add CloudWatch custom metrics
-const putMetric = async (metricName, value = 1, unit = 'Count') => {
-    const cloudwatch = new AWS.CloudWatch();
-    try {
-        await cloudwatch.putMetricData({
-            Namespace: 'TasksAPI',
-            MetricData: [{
-                MetricName: metricName,
-                Value: value,
-                Unit: unit,
-                Timestamp: new Date()
-            }]
-        }).promise();
-    } catch (error) {
-        console.error('Error putting metric:', error);
-        Sentry.captureException(error);
+        if (client) {
+            console.log('Releasing database client');
+            try {
+                await client.release();
+                console.log('Database client released successfully');
+            } catch (releaseError) {
+                console.error('Error releasing database client:', releaseError);
+            }
+        }
     }
 };

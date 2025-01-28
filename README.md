@@ -157,7 +157,8 @@ This will create:
 - CloudFront distribution
 - Route53 records (if domain provided)
 - CloudWatch log groups
-- Required IAM roles and policies
+- Required IAM roles and policiescd environments/aws/infrastructure
+terraform init
 
 #### 3. Apply Infrastructure
 
@@ -354,3 +355,108 @@ GitHub Actions workflows are configured for:
 - Follow the principle of least privilege
 - Regular security updates
 - Automated security scanning
+
+## Testing the API
+
+You can test the API endpoints using curl:
+
+```bash
+# Create a new task
+curl -X POST https://[YOUR-API-GATEWAY-URL]/prod/tasks \
+  -H "Content-Type: application/json" \
+  -d '{"title": "Test Task", "description": "This is a test task"}'
+
+# Get all tasks
+curl https://[YOUR-API-GATEWAY-URL]/prod/tasks
+```
+
+## Monitoring and Observability
+
+### Sentry
+- Error monitoring and reporting is configured in the Lambda function
+- View errors and performance metrics at: https://sentry.io/organizations/[YOUR-ORG]/issues/
+
+### CloudWatch
+- CloudWatch Dashboard: https://console.aws.amazon.com/cloudwatch/home?region=[REGION]#dashboards:name=tasks-api-dashboard
+- Metrics monitored:
+  - Lambda: Invocations, Errors, Duration
+  - API Gateway: Request Count, 4XX/5XX Errors, Latency
+  - RDS: CPU Utilization, Free Storage Space, Database Connections
+
+### CloudWatch Alarms
+The following alarms are configured:
+1. Lambda Error Rate: Triggers when errors exceed 1 per 5 minutes
+2. API Gateway Latency: Triggers when average latency exceeds 1000ms
+3. API Gateway 5XX Errors: Triggers when 5XX errors exceed 5 per 5 minutes
+
+## Security
+
+- Database credentials are managed through AWS Secrets Manager
+- API Gateway endpoints are secured with CORS policies
+- Lambda functions run in a VPC with private subnets
+- RDS instance is in a private subnet with restricted security group access
+
+## Architecture Diagram
+
+```
+CloudFront
+    ↓
+API Gateway
+    ↓
+Lambda Function (VPC)
+    ↓
+RDS PostgreSQL (Private Subnet)
+```
+
+## Known Issues and Limitations
+
+1. Rate Limiting: API Gateway is configured with default limits (10,000 requests per second)
+2. Database Scaling: RDS instance is t3.micro (suitable for development/testing)
+3. Cold Starts: Lambda functions in VPC may experience longer cold starts
+
+## Future Improvements
+
+1. Implement CI/CD pipeline with GitHub Actions
+2. Add unit tests for Lambda functions
+3. Set up Splunk integration for centralized logging
+4. Implement custom domain names for API and frontend
+5. Add authentication and authorization
+
+## Splunk Integration Architecture
+
+The application is designed to forward logs to Splunk using the following components:
+
+1. **AWS Kinesis Firehose**:
+   - Collects logs from CloudWatch Log Groups
+   - Buffers and batches logs for efficient delivery
+   - Provides reliable delivery with retry mechanisms
+   - Compresses data using GZIP
+
+2. **Log Sources**:
+   - Lambda function logs
+   - API Gateway access logs
+   - RDS PostgreSQL logs
+   - CloudWatch metrics
+
+3. **Delivery Flow**:
+```
+CloudWatch Logs → CloudWatch Log Subscription → Kinesis Firehose → Splunk HTTP Event Collector (HEC)
+```
+
+4. **Backup and Error Handling**:
+   - Failed deliveries are backed up to S3
+   - Configurable retry duration (60 seconds)
+   - Monitoring via CloudWatch metrics
+
+5. **Required Splunk Configuration** (not included in this demo):
+   - Splunk Enterprise or Splunk Cloud instance
+   - HTTP Event Collector (HEC) token
+   - Network access from AWS to Splunk HEC endpoint
+
+To complete the Splunk integration in a production environment:
+1. Replace `[SPLUNK-HEC-URL]` with your Splunk HEC endpoint
+2. Set up a Splunk HEC token and update the `access_key` in Firehose configuration
+3. Configure Splunk indexes and sourcetypes
+4. Create Splunk dashboards for monitoring
+
+Note: For this demo, the Splunk integration infrastructure is set up but not connected to an actual Splunk instance.

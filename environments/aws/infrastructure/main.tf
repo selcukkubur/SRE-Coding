@@ -21,23 +21,26 @@ provider "aws" {
   region = var.aws_region
 }
 
+# Get current AWS account ID
+data "aws_caller_identity" "current" {}
+
 # Data source for availability zones
 data "aws_availability_zones" "available" {
   state = "available"
 }
 
-# VPC and Network Configuration
+# VPC Configuration
 resource "aws_vpc" "main" {
   cidr_block           = "10.0.0.0/16"
   enable_dns_hostnames = true
   enable_dns_support   = true
 
   tags = {
-    Name = "tasks-api-vpc"
+    Name = "tasks-vpc"
   }
 }
 
-# Public and Private Subnets
+# Public Subnets
 resource "aws_subnet" "public" {
   count             = 2
   vpc_id            = aws_vpc.main.id
@@ -45,10 +48,11 @@ resource "aws_subnet" "public" {
   availability_zone = data.aws_availability_zones.available.names[count.index]
 
   tags = {
-    Name = "tasks-api-public-${count.index + 1}"
+    Name = "tasks-public-${count.index + 1}"
   }
 }
 
+# Private Subnets
 resource "aws_subnet" "private" {
   count             = 2
   vpc_id            = aws_vpc.main.id
@@ -56,8 +60,71 @@ resource "aws_subnet" "private" {
   availability_zone = data.aws_availability_zones.available.names[count.index]
 
   tags = {
-    Name = "tasks-api-private-${count.index + 1}"
+    Name = "tasks-private-${count.index + 1}"
   }
+}
+
+# Internet Gateway
+resource "aws_internet_gateway" "main" {
+  vpc_id = aws_vpc.main.id
+
+  tags = {
+    Name = "tasks-igw"
+  }
+}
+
+# Elastic IP for NAT Gateway
+resource "aws_eip" "nat" {
+}
+
+# NAT Gateway
+resource "aws_nat_gateway" "main" {
+  allocation_id = aws_eip.nat.id
+  subnet_id     = aws_subnet.public[0].id
+
+  tags = {
+    Name = "tasks-nat"
+  }
+}
+
+# Route Tables
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.main.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.main.id
+  }
+
+  tags = {
+    Name = "tasks-public-rt"
+  }
+}
+
+resource "aws_route_table" "private" {
+  vpc_id = aws_vpc.main.id
+
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.main.id
+  }
+
+  tags = {
+    Name = "tasks-private-rt"
+  }
+}
+
+# Route Table Associations
+resource "aws_route_table_association" "public" {
+  count          = 2
+  subnet_id      = aws_subnet.public[count.index].id
+  route_table_id = aws_route_table.public.id
+}
+
+resource "aws_route_table_association" "private" {
+  count          = 2
+  subnet_id      = aws_subnet.private[count.index].id
+  route_table_id = aws_route_table.private.id
 }
 
 # Secrets Manager for Database Credentials
@@ -82,6 +149,7 @@ resource "aws_db_subnet_group" "rds" {
   subnet_ids = aws_subnet.private[*].id
 }
 
+# Security Group for RDS
 resource "aws_security_group" "rds" {
   name        = "tasks-db-sg"
   description = "Security group for RDS PostgreSQL"
@@ -92,6 +160,19 @@ resource "aws_security_group" "rds" {
     to_port         = 5432
     protocol        = "tcp"
     security_groups = [aws_security_group.lambda.id]
+    description     = "Allow PostgreSQL access from Lambda"
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "Allow all outbound traffic"
+  }
+
+  tags = {
+    Name = "tasks-rds-sg"
   }
 }
 
@@ -169,7 +250,7 @@ resource "aws_iam_role_policy" "lambda_custom" {
   })
 }
 
-# Lambda Function Configuration
+# Security Group for Lambda
 resource "aws_security_group" "lambda" {
   name        = "tasks-lambda-sg"
   description = "Security group for Lambda function"
@@ -180,11 +261,18 @@ resource "aws_security_group" "lambda" {
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
+    description = "Allow all outbound traffic"
+  }
+
+  tags = {
+    Name = "tasks-lambda-sg"
   }
 }
 
+# Lambda Function Configuration
 resource "aws_lambda_function" "api" {
-  filename         = "../backend/dist/lambda.zip"
+  filename         = "${path.module}/../backend/dist/lambda.zip"
+  source_code_hash = filebase64sha256("${path.module}/../backend/dist/lambda.zip")
   function_name    = "tasks-api"
   role            = aws_iam_role.lambda_exec.arn
   handler         = "index.handler"
@@ -199,64 +287,171 @@ resource "aws_lambda_function" "api" {
 
   environment {
     variables = {
-      DB_HOST     = aws_db_instance.tasks.endpoint
-      DB_NAME     = var.database_name
-      DB_USER     = var.database_username
-      DB_PASSWORD = random_password.db_password.result
-      SENTRY_DSN  = var.sentry_dsn
+      DB_HOST        = aws_db_instance.tasks.address
+      DB_PORT        = tostring(aws_db_instance.tasks.port)
+      DB_NAME        = var.database_name
+      DB_USER        = var.database_username
+      DB_PASSWORD    = random_password.db_password.result
+      SENTRY_DSN     = var.sentry_dsn
+      ALLOWED_ORIGIN = "https://d3k2p6z3f2d2f6.cloudfront.net"
     }
   }
 }
 
-# API Gateway Configuration
+# API Gateway
 resource "aws_apigatewayv2_api" "tasks" {
   name          = "tasks-api"
   protocol_type = "HTTP"
+  
   cors_configuration {
-    allow_origins = ["*"]
-    allow_methods = ["GET", "POST", "OPTIONS"]
-    allow_headers = ["Content-Type", "Authorization"]
-    max_age      = 300
+    allow_origins = ["https://d3k2p6z3f2d2f6.cloudfront.net"]
+    allow_methods = ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
+    allow_headers = ["Content-Type", "Authorization", "X-Amz-Date", "X-Api-Key", "X-Amz-Security-Token", "X-Requested-With"]
+    expose_headers = ["*"]
+    max_age = 300
+    allow_credentials = true
   }
 }
 
-resource "aws_apigatewayv2_stage" "prod" {
-  api_id = aws_apigatewayv2_api.tasks.id
-  name   = "prod"
+# API Gateway Stage
+resource "aws_apigatewayv2_stage" "default" {
+  api_id      = aws_apigatewayv2_api.tasks.id
+  name        = "$default"
   auto_deploy = true
 
+  default_route_settings {
+    detailed_metrics_enabled = true
+    throttling_burst_limit  = 100
+    throttling_rate_limit   = 50
+  }
+
   access_log_settings {
-    destination_arn = aws_cloudwatch_log_group.api_gateway.arn
+    destination_arn = aws_cloudwatch_log_group.api_gw.arn
     format = jsonencode({
-      requestId      = "$context.requestId"
-      ip            = "$context.identity.sourceIp"
-      requestTime   = "$context.requestTime"
-      httpMethod    = "$context.httpMethod"
-      routeKey      = "$context.routeKey"
-      status        = "$context.status"
-      protocol      = "$context.protocol"
+      requestId     = "$context.requestId"
+      ip           = "$context.identity.sourceIp"
+      requestTime  = "$context.requestTime"
+      httpMethod   = "$context.httpMethod"
+      routeKey     = "$context.routeKey"
+      status       = "$context.status"
       responseLength = "$context.responseLength"
-      integrationLatency = "$context.integrationLatency"
+      errorMessage = "$context.error.message"
+      integrationError = "$context.integration.error"
+      integrationStatus = "$context.integration.status"
+      integrationLatency = "$context.integration.latency"
+      integration = {
+        error = "$context.integration.error"
+        integrationStatus = "$context.integration.status"
+        latency = "$context.integration.latency"
+        requestId = "$context.integration.requestId"
+        status = "$context.integration.status"
+      }
     })
+  }
+}
+
+# Lambda Integration
+resource "aws_apigatewayv2_integration" "lambda" {
+  api_id                 = aws_apigatewayv2_api.tasks.id
+  integration_type       = "AWS_PROXY"
+  integration_method     = "POST"
+  integration_uri        = aws_lambda_function.api.invoke_arn
+  payload_format_version = "2.0"
+  timeout_milliseconds   = 29000  # Set to slightly less than Lambda timeout
+}
+
+# API Routes - using a single route for all methods
+resource "aws_apigatewayv2_route" "tasks" {
+  api_id    = aws_apigatewayv2_api.tasks.id
+  route_key = "ANY /tasks"
+  target    = "integrations/${aws_apigatewayv2_integration.lambda.id}"
+}
+
+# CloudWatch Log Group for API Gateway
+resource "aws_cloudwatch_log_group" "api_gw" {
+  name              = "/aws/api-gateway/tasks-api"
+  retention_in_days = 7
+}
+
+# Lambda permission for API Gateway
+resource "aws_lambda_permission" "api_gw" {
+  statement_id  = "AllowExecutionFromAPIGateway"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.api.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_apigatewayv2_api.tasks.execution_arn}/*/*"
+}
+
+# VPC Endpoints
+resource "aws_vpc_endpoint" "api_gateway" {
+  vpc_id             = aws_vpc.main.id
+  service_name       = "com.amazonaws.${var.aws_region}.execute-api"
+  vpc_endpoint_type  = "Interface"
+  subnet_ids         = aws_subnet.private[*].id
+  security_group_ids = [aws_security_group.lambda.id]
+
+  private_dns_enabled = true
+
+  tags = {
+    Name = "tasks-api-gateway-endpoint"
+  }
+}
+
+resource "aws_vpc_endpoint" "logs" {
+  vpc_id             = aws_vpc.main.id
+  service_name       = "com.amazonaws.${var.aws_region}.logs"
+  vpc_endpoint_type  = "Interface"
+  subnet_ids         = aws_subnet.private[*].id
+  security_group_ids = [aws_security_group.lambda.id]
+
+  private_dns_enabled = true
+
+  tags = {
+    Name = "tasks-cloudwatch-logs-endpoint"
+  }
+}
+
+resource "aws_vpc_endpoint" "secretsmanager" {
+  vpc_id             = aws_vpc.main.id
+  service_name       = "com.amazonaws.${var.aws_region}.secretsmanager"
+  vpc_endpoint_type  = "Interface"
+  subnet_ids         = aws_subnet.private[*].id
+  security_group_ids = [aws_security_group.lambda.id]
+
+  private_dns_enabled = true
+
+  tags = {
+    Name = "tasks-secretsmanager-endpoint"
   }
 }
 
 # Frontend Configuration
 resource "aws_s3_bucket" "frontend" {
   bucket = var.frontend_bucket_name
+  force_destroy = true
 }
 
-resource "aws_s3_bucket_public_access_block" "frontend" {
+resource "aws_s3_bucket_versioning" "frontend" {
+  bucket = aws_s3_bucket.frontend.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_website_configuration" "frontend" {
   bucket = aws_s3_bucket.frontend.id
 
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
+  index_document {
+    suffix = "index.html"
+  }
+
+  error_document {
+    key = "index.html"
+  }
 }
 
 resource "aws_cloudfront_origin_access_identity" "frontend" {
-  comment = "OAI for ${var.frontend_bucket_name}"
+  comment = "OAI for frontend bucket"
 }
 
 resource "aws_s3_bucket_policy" "frontend" {
@@ -265,7 +460,7 @@ resource "aws_s3_bucket_policy" "frontend" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid       = "AllowCloudFrontOAI"
+        Sid       = "AllowCloudFrontAccess"
         Effect    = "Allow"
         Principal = {
           AWS = aws_cloudfront_origin_access_identity.frontend.iam_arn
@@ -279,12 +474,12 @@ resource "aws_s3_bucket_policy" "frontend" {
 
 resource "aws_cloudfront_distribution" "frontend" {
   enabled             = true
+  is_ipv6_enabled    = true
   default_root_object = "index.html"
-  price_class         = "PriceClass_100"
-
+  
   origin {
     domain_name = aws_s3_bucket.frontend.bucket_regional_domain_name
-    origin_id   = "S3-${aws_s3_bucket.frontend.id}"
+    origin_id   = "S3-${aws_s3_bucket.frontend.bucket}"
 
     s3_origin_config {
       origin_access_identity = aws_cloudfront_origin_access_identity.frontend.cloudfront_access_identity_path
@@ -294,10 +489,10 @@ resource "aws_cloudfront_distribution" "frontend" {
   default_cache_behavior {
     allowed_methods        = ["GET", "HEAD", "OPTIONS"]
     cached_methods         = ["GET", "HEAD"]
-    target_origin_id       = "S3-${aws_s3_bucket.frontend.id}"
+    target_origin_id      = "S3-${aws_s3_bucket.frontend.bucket}"
     viewer_protocol_policy = "redirect-to-https"
     compress              = true
-
+    
     forwarded_values {
       query_string = false
       cookies {
@@ -310,6 +505,18 @@ resource "aws_cloudfront_distribution" "frontend" {
     max_ttl     = 86400
   }
 
+  custom_error_response {
+    error_code         = 403
+    response_code      = 200
+    response_page_path = "/index.html"
+  }
+
+  custom_error_response {
+    error_code         = 404
+    response_code      = 200
+    response_page_path = "/index.html"
+  }
+
   restrictions {
     geo_restriction {
       restriction_type = "none"
@@ -320,24 +527,67 @@ resource "aws_cloudfront_distribution" "frontend" {
     cloudfront_default_certificate = true
   }
 
-  custom_error_response {
-    error_code         = 403
-    response_code      = 200
-    response_page_path = "/index.html"
-  }
+  price_class = "PriceClass_100"
 }
 
 # CloudWatch Configuration
 resource "aws_cloudwatch_log_group" "lambda" {
   name              = "/aws/lambda/${aws_lambda_function.api.function_name}"
-  retention_in_days = 14
+  retention_in_days = 7
 }
 
-resource "aws_cloudwatch_log_group" "api_gateway" {
-  name              = "/aws/apigateway/${aws_apigatewayv2_api.tasks.name}"
-  retention_in_days = 14
+# CloudWatch Alarms
+resource "aws_cloudwatch_metric_alarm" "lambda_errors" {
+  alarm_name          = "${aws_lambda_function.api.function_name}-error-rate"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = "2"
+  metric_name         = "Errors"
+  namespace           = "AWS/Lambda"
+  period             = "300"
+  statistic          = "Sum"
+  threshold          = "1"
+  alarm_description  = "This metric monitors lambda function errors"
+  
+  dimensions = {
+    FunctionName = aws_lambda_function.api.function_name
+  }
 }
 
+resource "aws_cloudwatch_metric_alarm" "api_latency" {
+  alarm_name          = "${aws_apigatewayv2_api.tasks.name}-latency"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = "2"
+  metric_name         = "Latency"
+  namespace           = "AWS/ApiGateway"
+  period             = "300"
+  statistic          = "Average"
+  threshold          = "1000"
+  alarm_description  = "This metric monitors API Gateway latency"
+  
+  dimensions = {
+    ApiId = aws_apigatewayv2_api.tasks.id
+    Stage = aws_apigatewayv2_stage.default.name
+  }
+}
+
+resource "aws_cloudwatch_metric_alarm" "api_5xx_errors" {
+  alarm_name          = "${aws_apigatewayv2_api.tasks.name}-5xx-errors"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = "2"
+  metric_name         = "5XXError"
+  namespace           = "AWS/ApiGateway"
+  period             = "300"
+  statistic          = "Sum"
+  threshold          = "5"
+  alarm_description  = "This metric monitors API Gateway 5XX errors"
+  
+  dimensions = {
+    ApiId = aws_apigatewayv2_api.tasks.id
+    Stage = aws_apigatewayv2_stage.default.name
+  }
+}
+
+# CloudWatch Dashboard
 resource "aws_cloudwatch_dashboard" "main" {
   dashboard_name = "tasks-api-dashboard"
 
@@ -349,11 +599,12 @@ resource "aws_cloudwatch_dashboard" "main" {
         y      = 0
         width  = 12
         height = 6
+
         properties = {
           metrics = [
             ["AWS/Lambda", "Invocations", "FunctionName", aws_lambda_function.api.function_name],
-            ["AWS/Lambda", "Errors", "FunctionName", aws_lambda_function.api.function_name],
-            ["AWS/Lambda", "Duration", "FunctionName", aws_lambda_function.api.function_name]
+            [".", "Errors", ".", "."],
+            [".", "Duration", ".", "."]
           ]
           period = 300
           stat   = "Sum"
@@ -367,39 +618,22 @@ resource "aws_cloudwatch_dashboard" "main" {
         y      = 0
         width  = 12
         height = 6
+
         properties = {
           metrics = [
-            ["AWS/ApiGateway", "Count", "ApiName", aws_apigatewayv2_api.tasks.name],
-            ["AWS/ApiGateway", "4XXError", "ApiName", aws_apigatewayv2_api.tasks.name],
-            ["AWS/ApiGateway", "5XXError", "ApiName", aws_apigatewayv2_api.tasks.name],
-            ["AWS/ApiGateway", "Latency", "ApiName", aws_apigatewayv2_api.tasks.name]
+            ["AWS/ApiGateway", "Count", "ApiId", aws_apigatewayv2_api.tasks.id, "Stage", aws_apigatewayv2_stage.default.name],
+            [".", "4XXError", ".", ".", ".", "."],
+            [".", "5XXError", ".", ".", ".", "."],
+            [".", "Latency", ".", ".", ".", "."]
           ]
           period = 300
-          stat   = "Average"
+          stat   = "Sum"
           region = var.aws_region
           title  = "API Gateway Metrics"
         }
       }
     ]
   })
-}
-
-# CloudWatch Alarms
-resource "aws_cloudwatch_metric_alarm" "lambda_errors" {
-  alarm_name          = "${aws_lambda_function.api.function_name}-error-rate"
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = "2"
-  metric_name         = "Errors"
-  namespace           = "AWS/Lambda"
-  period             = "300"
-  statistic          = "Sum"
-  threshold          = "1"
-  alarm_description  = "Lambda function error rate exceeded threshold"
-  alarm_actions      = [aws_sns_topic.alerts.arn]
-
-  dimensions = {
-    FunctionName = aws_lambda_function.api.function_name
-  }
 }
 
 # SNS Topic for Alerts
@@ -411,4 +645,155 @@ resource "aws_sns_topic_subscription" "alerts_email" {
   topic_arn = aws_sns_topic.alerts.arn
   protocol  = "email"
   endpoint  = var.alert_email
+}
+
+# Kinesis Firehose for Splunk Integration
+resource "aws_kinesis_firehose_delivery_stream" "splunk" {
+  name        = "tasks-api-splunk-stream"
+  destination = "http_endpoint"
+
+  http_endpoint_configuration {
+    url                = "https://dummy-splunk-endpoint.example.com"  # Replace with actual Splunk HEC URL in production
+    name              = "Splunk"
+    access_key        = "dummy-access-key"
+    buffering_size    = 1
+    buffering_interval = 60
+    retry_duration    = 60
+    role_arn          = aws_iam_role.firehose_role.arn
+    
+    s3_backup_mode = "FailedDataOnly"
+    
+    request_configuration {
+      content_encoding = "GZIP"
+    }
+  }
+
+  s3_configuration {
+    role_arn           = aws_iam_role.firehose_role.arn
+    bucket_arn         = aws_s3_bucket.log_archive.arn
+    buffer_size        = 5
+    buffer_interval    = 300
+    compression_format = "GZIP"
+  }
+}
+
+# Additional IAM policy for Firehose HTTP endpoint
+resource "aws_iam_role_policy" "firehose_http" {
+  name = "tasks-api-firehose-http"
+  role = aws_iam_role.firehose_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "logs:PutLogEvents"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+# S3 bucket for failed log delivery
+resource "aws_s3_bucket" "log_archive" {
+  bucket = "tasks-api-log-archive-${data.aws_caller_identity.current.account_id}"
+}
+
+# IAM role for Kinesis Firehose
+resource "aws_iam_role" "firehose_role" {
+  name = "tasks-api-firehose-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "firehose.amazonaws.com"
+        }
+      }
+    ]
+  })
+}
+
+# IAM policy for Firehose to write to S3
+resource "aws_iam_role_policy" "firehose_s3" {
+  name = "tasks-api-firehose-s3"
+  role = aws_iam_role.firehose_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:PutObject",
+          "s3:GetObject",
+          "s3:ListBucket"
+        ]
+        Resource = [
+          aws_s3_bucket.log_archive.arn,
+          "${aws_s3_bucket.log_archive.arn}/*"
+        ]
+      }
+    ]
+  })
+}
+
+# IAM role for CloudWatch to write to Firehose
+resource "aws_iam_role" "cloudwatch_subscription_role" {
+  name = "tasks-api-cloudwatch-subscription-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "logs.amazonaws.com"
+        }
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "cloudwatch_subscription_policy" {
+  name = "tasks-api-cloudwatch-subscription-policy"
+  role = aws_iam_role.cloudwatch_subscription_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "firehose:PutRecord",
+          "firehose:PutRecordBatch"
+        ]
+        Resource = [aws_kinesis_firehose_delivery_stream.splunk.arn]
+      }
+    ]
+  })
+}
+
+# CloudWatch Log Subscription Filter for Lambda logs
+resource "aws_cloudwatch_log_subscription_filter" "lambda_logs_to_firehose" {
+  name            = "lambda-logs-to-splunk"
+  log_group_name  = aws_cloudwatch_log_group.lambda.name
+  filter_pattern  = ""
+  destination_arn = aws_kinesis_firehose_delivery_stream.splunk.arn
+  role_arn        = aws_iam_role.cloudwatch_subscription_role.arn
+}
+
+# CloudWatch Log Subscription Filter for API Gateway logs
+resource "aws_cloudwatch_log_subscription_filter" "api_logs_to_firehose" {
+  name            = "tasks-api-logs-to-firehose"
+  log_group_name  = aws_cloudwatch_log_group.api_gw.name
+  filter_pattern  = ""
+  destination_arn = aws_kinesis_firehose_delivery_stream.splunk.arn
+  role_arn        = aws_iam_role.cloudwatch_subscription_role.arn
 }

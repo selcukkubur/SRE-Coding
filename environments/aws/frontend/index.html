@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Task Manager</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            line-height: 1.6;
+            margin: 0;
+            padding: 20px;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+        }
+        .task-form {
+            margin-bottom: 20px;
+        }
+        .form-group {
+            margin-bottom: 15px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+        }
+        input[type="text"], 
+        textarea {
+            width: 100%;
+            padding: 8px;
+            margin-bottom: 10px;
+        }
+        button {
+            background-color: #4CAF50;
+            color: white;
+            padding: 10px 15px;
+            border: none;
+            cursor: pointer;
+        }
+        button:hover {
+            background-color: #45a049;
+        }
+        button:disabled {
+            background-color: #cccccc;
+            cursor: not-allowed;
+        }
+        .task-list {
+            margin-top: 20px;
+        }
+        .task-item {
+            border: 1px solid #ddd;
+            padding: 10px;
+            margin-bottom: 10px;
+            border-radius: 4px;
+        }
+        .error {
+            color: red;
+            margin: 10px 0;
+            padding: 10px;
+            border: 1px solid #ffcdd2;
+            border-radius: 4px;
+            background-color: #ffebee;
+            display: none;
+            white-space: pre-wrap;
+            word-break: break-word;
+            font-family: monospace;
+            font-size: 14px;
+        }
+        .error.visible {
+            display: block;
+        }
+        .loading {
+            text-align: center;
+            padding: 20px;
+            color: #666;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Task Manager</h1>
+        
+        <div class="task-form">
+            <h2>Create New Task</h2>
+            <form id="taskForm">
+                <div class="form-group">
+                    <label for="title">Title:</label>
+                    <input type="text" id="title" required>
+                </div>
+                <div class="form-group">
+                    <label for="description">Description:</label>
+                    <textarea id="description" required></textarea>
+                </div>
+                <button type="submit">Create Task</button>
+            </form>
+            <div id="error" class="error"></div>
+        </div>
+
+        <div class="task-list">
+            <h2>Tasks</h2>
+            <div id="tasks"></div>
+        </div>
+    </div>
+
+    <script>
+        const API_URL = 'https://xpps8sqn7l.execute-api.us-east-1.amazonaws.com/tasks';
+        const errorDiv = document.getElementById('error');
+        const tasksDiv = document.getElementById('tasks');
+        const taskForm = document.getElementById('taskForm');
+
+        // Show loading state
+        function showLoading(element) {
+            element.innerHTML = '<div class="loading">Loading...</div>';
+        }
+
+        // Show error message
+        function showError(message) {
+            errorDiv.innerHTML = escapeHtml(message);
+            errorDiv.classList.add('visible');
+            // Clear error after 5 seconds
+            setTimeout(() => {
+                errorDiv.textContent = '';
+                errorDiv.classList.remove('visible');
+            }, 5000);
+        }
+
+        // Fetch and display tasks
+        async function loadTasks() {
+            showLoading(tasksDiv);
+            try {
+                const response = await fetch(API_URL, {
+                    headers: {
+                        'Accept': 'application/json',
+                        'Content-Type': 'application/json'
+                    }
+                });
+                
+                if (!response.ok) {
+                    const data = await response.json().catch(() => ({}));
+                    const errorMessage = data.message || data.error || `HTTP error! status: ${response.status}`;
+                    const error = new Error(errorMessage);
+                    error.details = data;
+                    throw error;
+                }
+                
+                const data = await response.json();
+                
+                tasksDiv.innerHTML = Array.isArray(data) && data.length 
+                    ? data.map(task => `
+                        <div class="task-item">
+                            <h3>${escapeHtml(task.title)}</h3>
+                            <p>${escapeHtml(task.description)}</p>
+                            <small>Created: ${new Date(task.created_at).toLocaleString()}</small>
+                        </div>
+                    `).join('') 
+                    : '<p>No tasks found</p>';
+            } catch (error) {
+                console.error('Error loading tasks:', error);
+                const errorMessage = error.details?.message || error.message;
+                const errorDetails = error.details?.details ? `\nDetails: ${JSON.stringify(error.details.details)}` : '';
+                showError(`Error loading tasks: ${errorMessage}${errorDetails}`);
+                tasksDiv.innerHTML = '<p>Failed to load tasks. Please try again later.</p>';
+            }
+        }
+
+        // Escape HTML to prevent XSS
+        function escapeHtml(unsafe) {
+            if (!unsafe) return '';
+            return unsafe
+                .toString()
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/"/g, "&quot;")
+                .replace(/'/g, "&#039;");
+        }
+
+        // Create new task
+        async function createTask(data) {
+            const response = await fetch(API_URL, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json'
+                },
+                body: JSON.stringify(data)
+            });
+            
+            if (!response.ok) {
+                const errorData = await response.json().catch(() => ({}));
+                const errorMessage = errorData.message || errorData.error || `HTTP error! status: ${response.status}`;
+                const error = new Error(errorMessage);
+                error.details = errorData;
+                throw error;
+            }
+            
+            return response.json();
+        }
+
+        // Handle form submission
+        taskForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            errorDiv.textContent = '';
+            errorDiv.classList.remove('visible');
+            
+            const title = document.getElementById('title').value.trim();
+            const description = document.getElementById('description').value.trim();
+            
+            if (!title || !description) {
+                showError('Title and description are required');
+                return;
+            }
+            
+            const submitButton = taskForm.querySelector('button[type="submit"]');
+            submitButton.disabled = true;
+            submitButton.textContent = 'Creating...';
+            
+            try {
+                await createTask({ title, description });
+                taskForm.reset();
+                await loadTasks();
+            } catch (error) {
+                console.error('Error creating task:', error);
+                const errorMessage = error.details?.message || error.message;
+                const errorDetails = error.details?.details ? `\nDetails: ${JSON.stringify(error.details.details)}` : '';
+                showError(`Error creating task: ${errorMessage}${errorDetails}`);
+            } finally {
+                submitButton.disabled = false;
+                submitButton.textContent = 'Create Task';
+            }
+        });
+
+        // Load tasks on page load
+        loadTasks();
+    </script>
+</body>
+</html>
